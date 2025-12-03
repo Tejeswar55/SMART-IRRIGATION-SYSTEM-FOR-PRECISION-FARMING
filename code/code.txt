@@ -1,0 +1,288 @@
+// --- Libraries ---
+#include <DHT.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// --- Pin Definitions ---
+#define DHTPIN D4
+const int PUMP_RELAY_PIN    = D1;
+const int LCD_SDA_PIN       = D2;
+const int LCD_SCL_PIN       = D3;
+const int RAIN_SENSOR_PIN   = D5;
+const int BUZZER_PIN        = D6;
+const int FLOAT_SWITCH_PIN  = D7;
+const int MANUAL_BUTTON_PIN = D8;
+const int MOISTURE_SENSOR_PIN = A0; // Analog A0
+
+// --- Sensor Calibration ---
+// !!! YOU MUST CALIBRATE THIS FOR YOUR 3.3V SENSOR !!!
+// Check Serial Monitor for "DEBUG: Raw Moisture (A0)" to find these values.
+const int MOISTURE_DRY_ANALOG = 850;  // Example: Raw A0 value when sensor is bone dry
+const int MOISTURE_WET_ANALOG = 350;  // Example: Raw A0 value when sensor is in water
+const int MOISTURE_DRY_THRESHOLD = 43; // %: Turn pump ON if below this
+const int MOISTURE_WET_THRESHOLD = 50; // %: Turn pump OFF if above this
+
+// --- System Configuration ---
+const long LOCAL_UPDATE_INTERVAL = 2000;  // 2 seconds for local sensors
+const long DEBOUNCE_DELAY = 50; // 50ms for button debounce
+
+// --- Component Objects ---
+DHT dht(DHTPIN, DHT11);
+LiquidCrystal_I2C lcd(0x27, 16, 2); // 0x27 is common, 0x3F is other
+
+// --- Global State Variables ---
+// Sensor Values
+float humidity = 0, temperature = 0, moisturePercentage = 0;
+bool isRaining = false, isTankFull = true, pumpState = false;
+
+// System Mode
+bool manualOverride = false; // True = Local Manual, False = Auto
+bool lcdFound = false;
+
+// Logic state
+bool autoPumpState_last = false; 
+
+// Timers
+unsigned long lastLocalUpdateTime = 0;
+unsigned long lastButtonPressTime = 0;
+int lastButtonState = HIGH;
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\n--- Autonomous Smart Irrigation System ---");
+
+  // --- Initialize Outputs ---
+  pinMode(PUMP_RELAY_PIN, OUTPUT);
+  digitalWrite(PUMP_RELAY_PIN, HIGH); // Active LOW relay starts OFF
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  Serial.println("Outputs Initialized.");
+
+  // --- Initialize Inputs ---
+  pinMode(RAIN_SENSOR_PIN, INPUT);
+  pinMode(FLOAT_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(MANUAL_BUTTON_PIN, INPUT_PULLUP);
+  Serial.println("Inputs Initialized.");
+
+  // --- Initialize Peripherals ---
+  dht.begin();
+  Serial.println("DHT Sensor Initialized.");
+
+  // --- LCD Fail-Safe Check ---
+  Serial.print("Checking for LCD at 0x27... ");
+  Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN);
+  Wire.beginTransmission(0x27);
+  byte error = Wire.endTransmission(); // 0 = Success, 2/4 = Error
+
+  if (error == 0) {
+    lcdFound = true;
+    Serial.println("LCD Found!");
+    lcd.init();
+    lcd.backlight();
+    lcd.setCursor(0, 0);
+    lcd.print("System Starting");
+    lcd.setCursor(0, 1);
+    lcd.print("Please Wait...");
+  } else {
+    lcdFound = false;
+    Serial.println("LCD not found. Skipping.");
+  }
+
+  Serial.println("--- Setup Complete ---");
+  delay(2000); // Wait for things to settle
+}
+
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // --- TASK 1: Handle Physical Button Press (Always checking) ---
+  handleButtonPress();
+
+  // --- TASK 2: Run Local Logic (Sensors, Auto-Mode, Actuators) ---
+  if (currentMillis - lastLocalUpdateTime >= LOCAL_UPDATE_INTERVAL) {
+    lastLocalUpdateTime = currentMillis;
+
+    Serial.println("--------------------");
+    Serial.println("Running Local Logic...");
+
+    // 1. Read all sensors
+    readSensors();
+
+    // 2. Decide what the local logic wants to do
+    bool autoPumpState = runControlLogic();
+
+    // 3. Handle manual override
+    handleManualOverride(autoPumpState);
+
+    // 4. Update all physical outputs
+    updateActuators();
+    
+    // 5. Update the LCD
+    updateDisplay();
+    
+    // 6. Print status to Serial
+    printToSerial();
+  }
+}
+
+
+// =================================================================
+// --- LOCAL HARDWARE LOGIC ---
+// =================================================================
+
+void readSensors() {
+  // Read DHT11
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature();
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println("WARN: Failed to read from DHT sensor!");
+    humidity = 0; temperature = 0; // Set to 0 on failure
+  }
+
+  // Read Moisture
+  int rawMoisture = analogRead(MOISTURE_SENSOR_PIN);
+  Serial.println("DEBUG: Raw Moisture (A0) = " + String(rawMoisture));
+  moisturePercentage = map(rawMoisture, MOISTURE_DRY_ANALOG, MOISTURE_WET_ANALOG, 0, 100);
+  moisturePercentage = constrain(moisturePercentage, 0, 100);
+
+  // Read Digital Sensors
+  isRaining = (digitalRead(RAIN_SENSOR_PIN) == LOW); // LOW = Raining
+  isTankFull = (digitalRead(FLOAT_SWITCH_PIN) == LOW); // LOW = Tank Full
+
+  Serial.println("DEBUG: Sensors Read.");
+}
+
+bool runControlLogic() {
+  Serial.print("DEBUG: Evaluating auto-logic... ");
+  
+  bool desiredPumpState = false;
+
+  // --- Safety Overrides (Highest Priority) ---
+  if (isRaining) {
+    Serial.println("Auto: OFF (Raining)");
+    desiredPumpState = false;
+  } else if (!isTankFull) {
+    Serial.println("Auto: OFF (Tank Empty)");
+    desiredPumpState = false;
+  } else {
+    // --- Automatic Mode Logic ---
+    if (moisturePercentage < MOISTURE_DRY_THRESHOLD) { // Soil is dry
+      desiredPumpState = true;
+      Serial.println("Auto: ON (Soil Dry)");
+    } else if (moisturePercentage >= MOISTURE_WET_THRESHOLD) { // Soil is wet
+      desiredPumpState = false;
+      Serial.println("Auto: OFF (Soil Wet)");
+    } else {
+      // Hysteresis Zone (e.g., 30-60%)
+      desiredPumpState = autoPumpState_last; 
+      Serial.println("Auto: No Change (Hysteresis)");
+    }
+  }
+
+  autoPumpState_last = desiredPumpState;
+  return desiredPumpState;
+}
+
+void handleManualOverride(bool autoPumpState) {
+  // This function decides the FINAL pump state.
+  
+  if (manualOverride) {
+    Serial.println("MODE: MANUAL (Local Button)");
+    // pumpState was already set by handleButtonPress()
+  } else {
+    Serial.println("MODE: AUTO (Local Logic)");
+    pumpState = autoPumpState; // Use the result from runControlLogic()
+  }
+}
+
+void updateActuators() {
+  Serial.print("DEBUG: Updating Actuators... ");
+  // Set Pump (Active LOW relay)
+  digitalWrite(PUMP_RELAY_PIN, pumpState ? LOW : HIGH);
+  Serial.print("Pump set to " + String(pumpState ? "ON (LOW)" : "OFF (HIGH)"));
+
+  // Set Buzzer (Active HIGH)
+  bool beep = (!isTankFull || isRaining);
+  digitalWrite(BUZZER_PIN, beep ? HIGH : LOW);
+  Serial.println(". Buzzer set to " + String(beep ? "ON" : "OFF"));
+}
+
+void printToSerial() {
+  Serial.println("--- STATUS ---");
+  Serial.print("  Moisture: " + String(moisturePercentage, 1) + "%");
+  Serial.print(" | Temp: " + String(temperature, 1) + "C");
+  Serial.print(" | Humid: " + String(humidity, 1) + "%");
+  Serial.println();
+  Serial.print("  Rain: " + String(isRaining ? "YES" : "NO"));
+  Serial.print(" | Tank: " + String(isTankFull ? "FULL" : "LOW"));
+  Serial.print(" | Pump: " + String(pumpState ? "ON" : "OFF"));
+  
+  // Show final system mode
+  if (manualOverride) {
+    Serial.println(" | Mode: MANUAL (Local)");
+  } else {
+    Serial.println(" | Mode: AUTO");
+  }
+}
+
+
+// =================================================================
+// --- BUTTON & LCD ---
+// =================================================================
+
+void handleButtonPress() {
+  int reading = digitalRead(MANUAL_BUTTON_PIN);
+
+  if (reading != lastButtonState) {
+    lastButtonPressTime = millis();
+  }
+
+  // Check if button has been stable for 50ms (debounce)
+  if ((millis() - lastButtonPressTime) > DEBOUNCE_DELAY) {
+    // If the button state has changed (from UP to DOWN)
+    if (reading == LOW && lastButtonState == HIGH) {
+      
+      // Toggle local manual override
+      manualOverride = !manualOverride;
+
+      // If we just entered manual mode, toggle the pump state
+      if (manualOverride) {
+        pumpState = !pumpState; // Toggle the current state
+        Serial.println("ACTION: Manual Override ON. Pump Toggled.");
+      } else {
+        Serial.println("ACTION: Automatic Mode Resumed.");
+      }
+    }
+  }
+  lastButtonState = reading;
+}
+
+void updateDisplay() {
+  if (!lcdFound) return; // Don't do anything if LCD isn't connected
+
+  lcd.clear();
+  lcd.setCursor(0, 0); // Top row
+
+  // --- Sensor Status Screen ---
+  lcd.print("M:" + String((int)moisturePercentage) + "% ");
+  lcd.print(pumpState ? "PMP:ON " : "PMP:OFF");
+
+  lcd.setCursor(0, 1); // Bottom row
+  if (!isTankFull) {
+    lcd.print("! WATER LOW !");
+  } else if (isRaining) {
+    lcd.print("! RAINING !");
+  } else {
+    // Use String() conversion for floats before concatenation
+    String tempStr = String(temperature, 0); // 0 decimal places
+    String humStr = String(humidity, 0);   // 0 decimal places
+    lcd.print("T:" + tempStr + "C H:" + humStr + "%");
+    
+    // If in manual mode, add an "M"
+    if (manualOverride) {
+      lcd.print(" M"); 
+    }
+  }
+}
